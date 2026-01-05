@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/
+
+# Mac
+.DS_Store
+
+# Enviroment Variables (SECRETS)
+.env
+.env.local
+
+# Large Models & Binary Assets
+*.gguf
+*.onnx
+*.bin
+# Exclude piper folder if re-added later, but we deleted it now
+piper/
+
+# Audio
+*.wav
+
+# Runtime Data (Memory)
+*_memory.json
+
+# Workspace Settings
+*.code-workspace
