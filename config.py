@@ -26,7 +26,7 @@ class Config:
         
         # Server Settings
         self.host: str = os.getenv("HOST", "0.0.0.0")
-        self.port: int = int(os.getenv("PORT", "8000"))
+        self.port: int = int(os.getenv("PORT", "8888"))
 
 @lru_cache()
 def cfg() -> Config:

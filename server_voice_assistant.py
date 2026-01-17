@@ -28,6 +28,7 @@ from config import cfg
 from utils import stderr_suppressor
 from skills.registry import registry
 from core.agent import Agent
+from utils.network import get_local_ip
 
 # Initialize Logging
 setup_logging()
@@ -56,9 +57,18 @@ def select_character() -> Dict[str, Any]:
             print("Please enter a number.")
 
 if __name__ == "__main__":
-    CURRENT_CHAR = select_character()
+    # If starting via CLI, maybe we want to select? 
+    # But for a background server, maybe we default.
+    # Let's check for a flag or env var, otherwise default to r2_67
+    default_char_name = os.getenv("DEFAULT_CHARACTER", "R2-67")
+    selected = next((c for c in CHARACTERS if c["name"] == default_char_name), CHARACTERS[0])
+    
+    if sys.stdin.isatty():
+        CURRENT_CHAR = select_character()
+    else:
+        CURRENT_CHAR = selected
 else:
-    CURRENT_CHAR = CHARACTERS[0] 
+    CURRENT_CHAR = CHARACTERS[0] # R2-67 is first in the list anyway
 
 # --- DERIVED CONFIG ---
 MEMORY_FILE = CURRENT_CHAR["memory_file"]
@@ -81,6 +91,13 @@ logger.info(f"--- LOADING {CURRENT_CHAR['name']} (v2.1 AGENTIC) ---")
 logger.info(f"Memorizing to: {MEMORY_FILE}")
 
 app = FastAPI()
+
+# Add detail logging for 422s
+@app.exception_handler(422)
+async def validation_exception_handler(request, exc):
+    logger.error(f"Validation Error: {exc.errors()}")
+    logger.error(f"Request body: {await request.body()}")
+    return Response(content=str(exc.errors()), status_code=422)
 
 # --- LOAD SYSTEMS ---
 logger.info("1. Loading Ears (Whisper)...")
@@ -134,14 +151,24 @@ if "--reset" in sys.argv:
 load_memory()
 logger.info("--- SYSTEMS READY ---")
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
+@app.head("/")
 async def get_harness():
-    """Serves the web-based test harness."""
-    try:
-        with open("harness.html", "r") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "<h1>Harness file not found</h1>"
+    """Serves the web-based test harness and handles heartbeats."""
+    return Response(content="Voice Assistant Server v2.1", media_type="text/plain")
+
+@app.get("/v1")
+@app.head("/v1")
+@app.get("/v1/")
+@app.head("/v1/")
+async def v1_heartbeat():
+    """Handles OpenAI discovery heartbeats."""
+    return {"status": "ok", "version": "v1"}
+
+@app.get("/api/version")
+async def ollama_version():
+    """Shim for Ollama version check."""
+    return {"version": "0.1.48"}
 
 class TextQuery(BaseModel):
     text: str
@@ -160,6 +187,187 @@ async def chat_text_endpoint(query: TextQuery):
     return {
         "speech": final_response,
         "history": CHAT_HISTORY[-5:] # Return a slice for UI updates
+    }
+
+# --- OPENAI COMPATIBILITY ENDPOINTS ---
+
+@app.get("/v1/models")
+async def list_models():
+    """Returns available characters as models for OpenAI compatibility."""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": char["id"],
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "local-assistant"
+            } for char in CHARACTERS
+        ]
+    }
+
+class OpenAIChatRequest(BaseModel):
+    model: str
+    messages: List[Dict[str, str]]
+    stream: Optional[bool] = False
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: OpenAIChatRequest):
+    """OpenAI-compatible chat completions endpoint."""
+    logger.info(f"[OPENAI API] Request for model: {req.model}")
+    
+    # Extract last user message
+    user_text = ""
+    for msg in reversed(req.messages):
+        if msg["role"] == "user":
+            user_text = msg["content"]
+            break
+            
+    if not user_text:
+        return {"error": "No user message found"}
+
+    # Process through agent loop
+    # Note: Currently we use the global CHAT_HISTORY. 
+    # Enchanted sends the full history, but our agent manages its own memory file.
+    # To be truly compatible with external clients that manage history, 
+    # we might want to use their history instead of our local one, 
+    # but our agent is designed for local persistence.
+    # For now, we'll use the user text and let the agent manage context.
+    
+    final_response = await process_agent_chat(user_text)
+    
+    return {
+        "id": "chatcmpl-local",
+        "object": "chat.completion",
+        "created": int(datetime.now().timestamp()),
+        "model": req.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": final_response
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    }
+
+# --- OLLAMA COMPATIBILITY SHIMS ---
+
+@app.get("/api/tags")
+@app.get("/v1/api/tags")
+async def ollama_tags():
+    """Shim for Ollama model discovery (Enchanted often calls this)."""
+    # Ollama Kit (used by Enchanted) is very picky about ISO8601 and details
+    now = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return {
+        "models": [
+            {
+                "name": f"{char['id']}:latest",
+                "model": f"{char['id']}:latest",
+                "modified_at": now,
+                "size": 4920734272,
+                "digest": f"local-sha256-{char['id']}",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": "llama",
+                    "families": ["llama"],
+                    "parameter_size": "8.0B",
+                    "quantization_level": "Q4_K_M"
+                }
+            } for char in CHARACTERS
+        ]
+    }
+
+class OllamaChatRequest(BaseModel):
+    model: str
+    messages: List[Dict[str, Any]]
+    stream: Optional[bool] = False
+
+    class Config:
+        extra = "allow" # Be permissive with Enchanted's metadata
+
+@app.post("/api/chat")
+@app.post("/v1/api/chat")
+async def ollama_chat(req: OllamaChatRequest):
+    """Shim for Ollama chat completion."""
+    try:
+        user_text = req.messages[-1]["content"] if req.messages else ""
+        final_response = await process_agent_chat(user_text)
+        
+        return {
+            "model": req.model,
+            "created_at": datetime.now().isoformat(),
+            "message": {
+                "role": "assistant",
+                "content": final_response
+            },
+            "done": True
+        }
+    except Exception as e:
+        logger.error(f"[OLLAMA SHIM ERROR] {e}")
+        return Response(content=str(e), status_code=500)
+
+class OllamaGenerateRequest(BaseModel):
+    model: str
+    prompt: Optional[str] = None
+    stream: Optional[bool] = False
+
+    class Config:
+        extra = "allow"
+
+@app.post("/api/generate")
+@app.post("/v1/api/generate")
+async def ollama_generate(req: OllamaGenerateRequest):
+    """Shim for Ollama generation."""
+    try:
+        prompt = req.prompt or ""
+        final_response = await process_agent_chat(prompt)
+        return {
+            "model": req.model,
+            "created_at": datetime.now().isoformat(),
+            "response": final_response,
+            "done": True
+        }
+    except Exception as e:
+        logger.error(f"[OLLAMA SHIM ERROR] {e}")
+        return Response(content=str(e), status_code=500)
+
+@app.get("/api/ps")
+async def ollama_ps():
+    """Shim for running models list."""
+    return {"models": []}
+
+@app.post("/api/show")
+async def ollama_show(req: Dict[str, Any]):
+    """Shim for model details."""
+    model_name = req.get("name") or req.get("model", "")
+    lookup = model_name.split(":")[0]
+    char = next((c for c in CHARACTERS if c["id"] == lookup or c["name"] == lookup), CHARACTERS[0])
+    
+    return {
+        "license": "Local Assistant License",
+        "modelfile": f"FROM {lookup}\nSYSTEM \"\"\"{char['system_prompt']}\"\"\"",
+        "parameters": "stop \"<|end_of_text|>\"",
+        "template": "{{ .System }}\nUSER: {{ .Prompt }}\nASSISTANT: ",
+        "details": {
+            "parent_model": "",
+            "format": "gguf",
+            "family": "llama",
+            "families": ["llama"],
+            "parameter_size": "8.0B",
+            "quantization_level": "Q4_K_M"
+        },
+        "messages": [
+            {"role": "system", "content": char["system_prompt"]}
+        ]
     }
 
 async def process_agent_chat(user_text: str) -> str:
@@ -217,4 +425,8 @@ async def chat_endpoint(file: UploadFile = File(...)):
     return Response(content=wav_data, media_type="audio/wav")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host=cfg().host, port=cfg().port)
+    local_ip = get_local_ip()
+    port = cfg().port
+    logger.info(f"🚀 Server starting on http://{local_ip}:{port}")
+    logger.info(f"📱 Connect Enchanted with Base URL: http://{local_ip}:{port}/v1")
+    uvicorn.run(app, host=cfg().host, port=port)

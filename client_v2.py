@@ -25,7 +25,7 @@ import time
 import subprocess
 
 # --- CONFIG ---
-SERVER_URL = "http://localhost:8000/chat"
+SERVER_URL = "http://localhost:8888/chat"
 SAMPLE_RATE = 16000
 CHANNELS = 1
 

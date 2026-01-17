@@ -93,6 +93,8 @@ class Agent:
         skill_args = {}
         if target_action == "google_search":
              skill_args["query"] = ai_data.get("search_query") or ai_data.get("query")
+        elif target_action == "calculator":
+             skill_args["expression"] = ai_data.get("expression") or ai_data.get("search_query") or ai_data.get("query")
         else:
             # Generic mapping
             for k, v in ai_data.items():

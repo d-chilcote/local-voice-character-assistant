@@ -3,7 +3,7 @@ import json
 import sys
 
 def run_harness():
-    server_url = "http://127.0.0.1:8000/chat/text"
+    server_url = "http://127.0.0.1:8888/chat/text"
     
     print("\n" + "="*50)
     print("🤖 AGENT TEXT HARNESS (v1.0)")
