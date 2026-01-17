@@ -17,7 +17,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Body
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from fastapi.responses import Response, HTMLResponse
 from llama_cpp import Llama
 from faster_whisper import WhisperModel
@@ -27,8 +27,12 @@ from logger_config import setup_logging, get_logger
 from config import cfg
 from utils import stderr_suppressor
 from skills.registry import registry
-from core.agent import Agent
+from core.agent_graph import create_agent_graph, AgentState
+from core.llm_langchain import create_chat_llm
+from core.tools_bridge import get_all_tools
+from core.llm import BaseLLM, LlamaCPPLLM
 from utils.network import get_local_ip
+from langchain_core.messages import HumanMessage
 
 # Initialize Logging
 setup_logging()
@@ -36,7 +40,117 @@ logger = get_logger(__name__)
 
 # --- GLOBAL STATE ---
 CURRENT_CHAR = None
-CHAT_HISTORY: List[Dict[str, str]] = []
+CHAT_HISTORY: List[Dict[str, str]] = []  # Legacy, kept for compatibility
+SELECTED_LLM: Optional[BaseLLM] = None
+SELECTED_MODEL_PATH: Optional[str] = None  # Track path for LangChain
+SELECTED_MODEL_CONFIG: Dict[str, Any] = {}  # Model-specific config for LangChain
+
+# --- CLI MODEL SELECTION ---
+def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
+    """Prompts user to select a local GGUF model. Returns (llm, path, config_dict)."""
+    options = []
+    
+    # 1. Local GGUF Files (search ~/ai/models/ only)
+    search_path = os.path.expanduser("~/ai/models/")
+    if os.path.exists(search_path):
+        try:
+            gguf_files = [f for f in os.listdir(search_path) if f.endswith(".gguf")]
+            for f in gguf_files:
+                full_path = os.path.join(search_path, f)
+                options.append({
+                    "name": f"Local: {f} (via LlamaCPP)",
+                    "type": "llama-cpp",
+                    "path": full_path
+                })
+        except Exception as e:
+            logger.warning(f"Error scanning for GGUF files in {search_path}: {e}")
+    
+    if not options:
+        logger.error("No GGUF models found.")
+        sys.exit(1)
+
+    print("\n╔══════════════════════════════════════╗")
+    print("║   SELECT BRAIN (LLM BACKEND)         ║")
+    print("╠══════════════════════════════════════╣")
+    for idx, opt in enumerate(options):
+        print(f"║ {idx + 1}. {opt['name']:<31} ║")
+    print("╚══════════════════════════════════════╝")
+
+    while True:
+        try:
+            choice = int(input(f"\nEnter choice (1-{len(options)}): "))
+            if 1 <= choice <= len(options):
+                selected = options[choice - 1]
+                if selected["type"] == "llama-cpp":
+                    # Check for model-specific flags
+                    model_path_lower = selected["path"].lower()
+                    is_nemotron = "nemotron" in model_path_lower
+                    is_devstral = "devstral" in model_path_lower
+                    is_qwen = "qwen" in model_path_lower
+                    
+                    # Global "Mac Studio" Optimized Defaults
+                    n_ctx = cfg().llama_n_ctx
+                    n_gpu_layers = 99
+                    flash_attn = True
+                    use_mlock = True
+                    chat_format = None
+                    default_inference_params = {}
+
+                    if is_nemotron:
+                        # Nemotron is large MoE model - use smaller context to avoid memory issues
+                        n_ctx = 32768
+                        chat_format = "chatml-function-calling"
+                        default_inference_params = {
+                            "temperature": 0.3,
+                            "repeat_penalty": 1.1
+                        }
+                        logger.info(f"Applying Nemotron optimization flags for {selected['path']} (n_ctx={n_ctx})")
+                    
+                    elif is_devstral:
+                        n_ctx = 131072
+                        chat_format = "mistral-instruct"  # Devstral uses Mistral chat format
+                        default_inference_params = {
+                            "temperature": 0.1,
+                            "min_p": 0.1,
+                            "repeat_penalty": 1.05
+                        }
+                        logger.info(f"Applying Devstral optimization flags for {selected['path']}")
+                    
+                    elif is_qwen:
+                        n_ctx = 131072
+                        chat_format = "chatml-function-calling"  # Qwen uses ChatML
+                        default_inference_params = {
+                            "temperature": 0.6,
+                            "min_p": 0.1
+                        }
+                        logger.info(f"Applying Qwen optimization flags for {selected['path']}")
+
+                    try:
+                        llm_instance = LlamaCPPLLM(
+                            model_path=selected["path"],
+                            n_gpu_layers=n_gpu_layers,
+                            n_ctx=n_ctx,
+                            n_threads=cfg().llama_n_threads,
+                            flash_attn=flash_attn,
+                            use_mlock=use_mlock,
+                            chat_format=chat_format,
+                            default_inference_params=default_inference_params
+                        )
+                        return llm_instance, selected["path"], {
+                            "n_ctx": n_ctx,
+                            "n_gpu_layers": n_gpu_layers,
+                            "flash_attn": flash_attn,
+                            "use_mlock": use_mlock,
+                            "temperature": default_inference_params.get("temperature", 0.7),
+                            "chat_format": chat_format,  # Pass to LangChain LLM
+                        }
+                    except Exception as model_error:
+                        logger.error(f"Failed to load model: {model_error}")
+                        print(f"Error loading model: {model_error}")
+                        continue
+            print("Invalid number.")
+        except ValueError:
+            print("Enter a number.")
 
 # --- CLI CHARACTER SELECTION ---
 def select_character() -> Dict[str, Any]:
@@ -61,14 +175,45 @@ if __name__ == "__main__":
     # But for a background server, maybe we default.
     # Let's check for a flag or env var, otherwise default to r2_67
     default_char_name = os.getenv("DEFAULT_CHARACTER", "R2-67")
-    selected = next((c for c in CHARACTERS if c["name"] == default_char_name), CHARACTERS[0])
+    selected_char = next((c for c in CHARACTERS if c["name"] == default_char_name), CHARACTERS[0])
     
     if sys.stdin.isatty():
+        # Brain first, then Body
+        SELECTED_LLM, SELECTED_MODEL_PATH, SELECTED_MODEL_CONFIG = select_model()
         CURRENT_CHAR = select_character()
     else:
-        CURRENT_CHAR = selected
+        SELECTED_MODEL_PATH = cfg().llama_path
+        SELECTED_MODEL_CONFIG = {
+            "n_ctx": cfg().llama_n_ctx,
+            "n_gpu_layers": cfg().llama_n_gpu_layers,
+            "flash_attn": True,
+            "use_mlock": True,
+            "temperature": 0.7,
+        }
+        SELECTED_LLM = LlamaCPPLLM(
+            model_path=SELECTED_MODEL_PATH, 
+            n_gpu_layers=cfg().llama_n_gpu_layers, 
+            n_ctx=cfg().llama_n_ctx, 
+            n_threads=cfg().llama_n_threads
+        )
+        CURRENT_CHAR = selected_char
 else:
-    CURRENT_CHAR = CHARACTERS[0] # R2-67 is first in the list anyway
+    CURRENT_CHAR = CHARACTERS[0]
+    SELECTED_MODEL_PATH = cfg().llama_path
+    SELECTED_MODEL_CONFIG = {
+        "n_ctx": cfg().llama_n_ctx,
+        "n_gpu_layers": cfg().llama_n_gpu_layers,
+        "flash_attn": True,
+        "use_mlock": True,
+        "temperature": 0.7,
+    }
+    # In non-main context (like uvicorn workers if they reload), we need a default LLM
+    SELECTED_LLM = LlamaCPPLLM(
+        model_path=SELECTED_MODEL_PATH, 
+        n_gpu_layers=cfg().llama_n_gpu_layers, 
+        n_ctx=cfg().llama_n_ctx, 
+        n_threads=cfg().llama_n_threads
+    )
 
 # --- DERIVED CONFIG ---
 MEMORY_FILE = CURRENT_CHAR["memory_file"]
@@ -103,25 +248,39 @@ async def validation_exception_handler(request, exc):
 logger.info("1. Loading Ears (Whisper)...")
 whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
 
-logger.info("2. Loading Brain (Llama)...")
-with stderr_suppressor():
-    llm = Llama(
+logger.info("2. Ensuring Brain is Ready...")
+llm = SELECTED_LLM
+if not llm:
+    # Fallback for weird edge cases
+    llm = LlamaCPPLLM(
         model_path=cfg().llama_path, 
         n_gpu_layers=cfg().llama_n_gpu_layers, 
         n_ctx=cfg().llama_n_ctx, 
-        n_threads=cfg().llama_n_threads, 
-        verbose=False
+        n_threads=cfg().llama_n_threads
     )
 
 logger.info(f"3. Voice Engine: {MAC_VOICE}...")
 
-# --- AGENT INITIALIZATION ---
-agent = Agent(
-    name=CURRENT_CHAR["name"],
-    system_prompt=CURRENT_CHAR["system_prompt"],
-    llm=llm,
-    registry=registry
+# --- LANGGRAPH AGENT INITIALIZATION ---
+logger.info("4. Initializing LangGraph Agent...")
+langchain_llm = create_chat_llm(
+    model_path=SELECTED_MODEL_PATH or cfg().llama_path,
+    n_ctx=SELECTED_MODEL_CONFIG.get("n_ctx", cfg().llama_n_ctx),
+    n_gpu_layers=SELECTED_MODEL_CONFIG.get("n_gpu_layers", cfg().llama_n_gpu_layers),
+    n_threads=cfg().llama_n_threads,
+    temperature=SELECTED_MODEL_CONFIG.get("temperature", 0.7),
+    flash_attn=SELECTED_MODEL_CONFIG.get("flash_attn", True),
+    use_mlock=SELECTED_MODEL_CONFIG.get("use_mlock", True),
+    chat_format=SELECTED_MODEL_CONFIG.get("chat_format", "chatml-function-calling"),
 )
+tools = get_all_tools()
+agent_graph = create_agent_graph(
+    llm=langchain_llm,
+    tools=tools,
+    system_prompt=CURRENT_CHAR["system_prompt"],
+    checkpointer=None  # Phase 6 will add SQLite checkpointer
+)
+logger.info(f"Agent initialized with {len(tools)} tools")
 def load_memory() -> None:
     global CHAT_HISTORY
     if os.path.exists(MEMORY_FILE):
@@ -291,8 +450,7 @@ class OllamaChatRequest(BaseModel):
     messages: List[Dict[str, Any]]
     stream: Optional[bool] = False
 
-    class Config:
-        extra = "allow" # Be permissive with Enchanted's metadata
+    model_config = ConfigDict(extra="allow") # Be permissive with Enchanted's metadata
 
 @app.post("/api/chat")
 @app.post("/v1/api/chat")
@@ -320,8 +478,7 @@ class OllamaGenerateRequest(BaseModel):
     prompt: Optional[str] = None
     stream: Optional[bool] = False
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 @app.post("/api/generate")
 @app.post("/v1/api/generate")
@@ -372,17 +529,56 @@ async def ollama_show(req: Dict[str, Any]):
 
 async def process_agent_chat(user_text: str) -> str:
     """
-    Shared logic to handle the agent's reasoning loop for both audio and text.
+    Shared logic to handle the agent's reasoning loop using LangGraph.
     """
-    global CHAT_HISTORY
+    import re
     
-    # Delegate to Agent
-    response_text, CHAT_HISTORY = agent.chat(user_text, CHAT_HISTORY)
+    def clean_response(text: str) -> str:
+        """Strip model artifacts from response text."""
+        if not text:
+            return text
+        # Remove <tool_call>...</tool_call> tags and content
+        text = re.sub(r'<tool_call>.*?</tool_call>', '', text, flags=re.DOTALL)
+        # Remove <think>...</think> tags and content
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        # Remove any remaining unclosed tags
+        text = re.sub(r'</?tool_call>', '', text)
+        text = re.sub(r'</?think>', '', text)
+        # Remove Nemotron <function> tags and content
+        text = re.sub(r'<function=\w+>.*?</function>', '', text, flags=re.DOTALL)
+        # Remove Nemotron's chain-of-thought thinking prefixes
+        # These patterns indicate internal reasoning, not user-facing response
+        thinking_patterns = [
+            r'^We need to respond.*?\.(?:\s|$)',
+            r'^We have the weather.*?(?=(?:[A-Z]|$))',
+            r'^We can (?:use|answer|call).*?\.(?:\s|$)',
+            r'^We should.*?\.(?:\s|$)',
+            r'^Thus (?:make|output).*?\.(?:\s|$)',
+            r'^We must.*?\.(?:\s|$)',
+        ]
+        for pattern in thinking_patterns:
+            text = re.sub(pattern, '', text, flags=re.MULTILINE | re.IGNORECASE)
+        # Clean up whitespace
+        text = re.sub(r'\n\s*\n', '\n', text).strip()
+        return text
     
-    # Save History 
-    save_memory()
-    
-    return response_text
+    try:
+        result = agent_graph.invoke(
+            {"messages": [HumanMessage(content=user_text)]},
+            config={"configurable": {"thread_id": CURRENT_CHAR["id"]}}
+        )
+        # Extract the last AI message content
+        last_message = result["messages"][-1]
+        response_text = last_message.content if hasattr(last_message, 'content') else str(last_message)
+        
+        # Clean the response
+        response_text = clean_response(response_text)
+        
+        logger.info(f"Agent response: {response_text[:100]}..." if len(response_text) > 100 else f"Agent response: {response_text}")
+        return response_text if response_text else "I'm not sure how to respond to that."
+    except Exception as e:
+        logger.error(f"Agent error: {e}")
+        return "I encountered an error processing your request."
 
 @app.post("/chat")
 async def chat_endpoint(file: UploadFile = File(...)):

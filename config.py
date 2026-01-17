@@ -10,7 +10,7 @@ class Config:
     """Centralized configuration for the voice assistant."""
     
     def __init__(self):
-        # Paths
+        # Core Settings
         self.llama_path: str = os.getenv("LLAMA_PATH", "./Meta-Llama-3-8B-Instruct-Q4_K_M.gguf")
         
         # API Keys
@@ -18,7 +18,7 @@ class Config:
         
         # LLM Settings
         self.llama_n_gpu_layers: int = int(os.getenv("LLAMA_GPU_LAYERS", "-1"))
-        self.llama_n_ctx: int = int(os.getenv("LLAMA_CTX", "8192"))
+        self.llama_n_ctx: int = int(os.getenv("LLAMA_CTX", "32768"))
         self.llama_n_threads: int = int(os.getenv("LLAMA_THREADS", "8"))
         
         # Chat Settings

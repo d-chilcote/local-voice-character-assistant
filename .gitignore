@@ -26,3 +26,7 @@ piper/
 
 # Workspace Settings
 *.code-workspace
+
+# Logs and Temporary Files
+server_test_log.txt
+*.log

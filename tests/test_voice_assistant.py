@@ -164,37 +164,36 @@ def test_empty_transcription_returns_empty_response():
 
 
 # =============================================================================
-# 6. GEMINI SAFETY SETTINGS (Medium)
+# 6. LANGGRAPH ARCHITECTURE (Medium) - Updated from Gemini safety tests
 # =============================================================================
-def test_safety_settings_categories_are_defined():
-    """Verify all 4 critical safety categories are referenced in code."""
-    # Read the source file to verify safety settings exist
+def test_langgraph_components_are_imported():
+    """Verify LangGraph components are imported in server."""
     import pathlib
     source_path = pathlib.Path(__file__).parent.parent / "server_voice_assistant.py"
     
     with open(source_path, 'r') as f:
         source_code = f.read()
     
-    required_categories = [
-        "HARM_CATEGORY_HARASSMENT",
-        "HARM_CATEGORY_HATE_SPEECH",
-        "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        "HARM_CATEGORY_DANGEROUS_CONTENT",
+    required_imports = [
+        "create_agent_graph",
+        "create_chat_llm",
+        "get_all_tools",
+        "HumanMessage",
     ]
     
-    for category in required_categories:
-        assert category in source_code, f"Safety category {category} not found in source"
+    for component in required_imports:
+        assert component in source_code, f"LangGraph component {component} not found in source"
 
 
-def test_safety_threshold_is_strict():
-    """Verify safety threshold is set to BLOCK_LOW_AND_ABOVE (strictest)."""
+def test_agent_graph_invoke_is_used():
+    """Verify the server uses agent_graph.invoke for processing."""
     import pathlib
     source_path = pathlib.Path(__file__).parent.parent / "server_voice_assistant.py"
     
     with open(source_path, 'r') as f:
         source_code = f.read()
     
-    assert "BLOCK_LOW_AND_ABOVE" in source_code, "Safety threshold should be BLOCK_LOW_AND_ABOVE"
+    assert "agent_graph.invoke" in source_code, "Server should use agent_graph.invoke"
 
 
 # =============================================================================
@@ -265,14 +264,12 @@ def test_character_indices_are_valid():
 # =============================================================================
 # 10. PER-CHARACTER SYSTEM PROMPTS (Low)
 # =============================================================================
-def test_all_prompts_contain_json_schema():
-    """Every character's system prompt must instruct JSON output."""
+def test_all_prompts_contain_tool_instructions():
+    """Every character's system prompt must have tool-calling instructions."""
     for char in CHARACTERS:
         prompt = char["system_prompt"]
-        assert "JSON" in prompt.upper(), f"Character '{char['name']}' prompt missing JSON instruction"
-        assert "thought" in prompt, f"Character '{char['name']}' prompt missing 'thought' field"
-        assert "call_to_action" in prompt, f"Character '{char['name']}' prompt missing 'call_to_action'"
-        assert "speech" in prompt, f"Character '{char['name']}' prompt missing 'speech' field"
+        assert "tools" in prompt.lower(), f"Character '{char['name']}' prompt missing tools reference"
+        assert "google_search" in prompt.lower(), f"Character '{char['name']}' prompt missing google_search tool"
 
 
 def test_prompts_are_unique():

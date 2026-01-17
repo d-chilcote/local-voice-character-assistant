@@ -1,9 +1,9 @@
 from datetime import datetime
 import json
 from typing import List, Dict, Any, Optional, Tuple
-from llama_cpp import Llama
 from logger_config import get_logger
 from skills.registry import SkillRegistry
+from core.llm import BaseLLM
 
 logger = get_logger(__name__)
 
@@ -16,7 +16,7 @@ class Agent:
         self, 
         name: str, 
         system_prompt: str, 
-        llm: Llama, 
+        llm: BaseLLM, 
         registry: SkillRegistry,
         config: Optional[Dict[str, Any]] = None
     ):
@@ -91,15 +91,31 @@ class Agent:
         
         # Extract Arguments
         skill_args = {}
-        if target_action == "google_search":
-             skill_args["query"] = ai_data.get("search_query") or ai_data.get("query")
-        elif target_action == "calculator":
-             skill_args["expression"] = ai_data.get("expression") or ai_data.get("search_query") or ai_data.get("query")
-        else:
-            # Generic mapping
-            for k, v in ai_data.items():
-                if k not in ["thought", "call_to_action", "speech"]:
+
+        # 1. Pull from explicit 'arguments' dict (New Standard)
+        if "arguments" in ai_data and isinstance(ai_data["arguments"], dict):
+            skill_args.update(ai_data["arguments"])
+
+        # 2. Pull from top-level keys (Legacy / Hallucination fallback)
+        for k, v in ai_data.items():
+            if k not in ["thought", "call_to_action", "speech", "arguments"]:
+                # Only add if not already present (prefer explicit args)
+                if k not in skill_args:
                     skill_args[k] = v
+        
+        # 3. Specific overrides/aliases
+        if target_action == "google_search":
+             # Support 'search_query' alias if 'query' is missing
+             if "query" not in skill_args:
+                 if "search_query" in ai_data:
+                     skill_args["query"] = ai_data["search_query"]
+                 elif "search_query" in skill_args:
+                     skill_args["query"] = skill_args.pop("search_query")
+
+        # Inject Special Context for System Skills (like memory erasure)
+        skill_args["history"] = history
+        if self.config.get("memory_file"):
+            skill_args["memory_file"] = self.config["memory_file"]
                     
         logger.info(f"{self.name} (Action): Executing {target_action} with {skill_args}...")
         
@@ -139,12 +155,34 @@ class Agent:
                 messages=messages,
                 temperature=0.7,
                 max_tokens=300,
-                response_format={"type": "json_object"},
-                stop=["}"]
+                response_format={
+                    "type": "json_object",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "thought": {"type": "string"},
+                            "call_to_action": {"type": "string"},
+                            "arguments": {"type": "object", "additionalProperties": True},
+                            "speech": {"type": "string"}
+                        },
+                        "required": ["thought", "call_to_action", "arguments", "speech"],
+                        "additionalProperties": True 
+                    }
+                }
             )
             raw = response['choices'][0]['message']['content']
-            if not raw.strip().endswith("}"): raw += "}"
+            logger.info(f"Raw LLM Response: '{raw}'")
+            
+            if not raw.strip():
+                logger.error("LLM returned empty response.")
+                return {"thought": "Empty response", "call_to_action": "reply", "speech": "I have nothing to say to that."}
+
+            if not raw.strip().endswith("}"): 
+                raw += "}"
+            
             return json.loads(raw)
         except Exception as e:
             logger.error(f"LLM/JSON Error: {e}")
+            if 'raw' in locals():
+                logger.error(f"Failed to parse raw content: '{raw}'")
             return {"thought": "Error", "call_to_action": "reply", "speech": "My brain hurts."}
