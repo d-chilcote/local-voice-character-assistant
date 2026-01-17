@@ -1,6 +1,6 @@
 import math
 
-def execute(expression: str) -> str:
+def execute(expression: str, **kwargs) -> str:
     """Evaluates a mathematical expression safely."""
     allowed_names = {k: v for k, v in math.__dict__.items() if not k.startswith("__")}
     allowed_names.update({"abs": abs, "round": round, "min": min, "max": max, "pow": pow})

@@ -1,6 +1,7 @@
 import os
 import re
 import importlib.util
+import inspect
 from typing import Dict, Any, List, Optional
 from logger_config import get_logger
 
@@ -149,14 +150,20 @@ class SkillRegistry:
                     break
             
             if not func_name:
-                logger.error(f"Script {script_path} missing execute function.")
-                return None
+                error_msg = f"Script {script_path} missing execute function."
+                logger.error(error_msg)
+                return error_msg
             
             func = getattr(module, func_name)
             
-            # Pass arguments (like search query)
-            # We map 'query' to the function's arguments
-            return func(**kwargs)
+            # Robust Argument Filtering: Only pass kwargs that the function accepts
+            sig = inspect.signature(func)
+            filtered_kwargs = {
+                k: v for k, v in kwargs.items() 
+                if k in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            }
+            
+            return func(**filtered_kwargs)
 
         except Exception as e:
             logger.error(f"Error executing script {script_path}: {e}")
