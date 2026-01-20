@@ -411,13 +411,24 @@ async def chat_endpoint(file: UploadFile = File(...)):
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    subprocess.run([
+    process = await asyncio.create_subprocess_exec(
         "say",
         "-v", MAC_VOICE,
         "-o", output_file,
         "--data-format=LEF32@22050",
-        final_response
-    ])
+        final_response,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        logger.error(f"Speech synthesis failed (code {process.returncode}): {stderr.decode()}")
+        return Response(content="Error generating speech", status_code=500)
+
+    if not os.path.exists(output_file):
+        logger.error("Speech synthesis output file missing")
+        return Response(content="Error generating speech", status_code=500)
 
     with open(output_file, "rb") as f:
         wav_data = f.read()
