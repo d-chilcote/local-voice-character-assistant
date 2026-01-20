@@ -411,13 +411,14 @@ async def chat_endpoint(file: UploadFile = File(...)):
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    subprocess.run([
+    proc = await asyncio.create_subprocess_exec(
         "say",
         "-v", MAC_VOICE,
         "-o", output_file,
         "--data-format=LEF32@22050",
         final_response
-    ])
+    )
+    await proc.wait()
 
     with open(output_file, "rb") as f:
         wav_data = f.read()
