@@ -40,6 +40,7 @@ logger = get_logger(__name__)
 
 # --- GLOBAL STATE ---
 CURRENT_CHAR = None
+<<<<<<< HEAD
 CHAT_HISTORY: List[Dict[str, str]] = []  # Legacy, kept for compatibility
 SELECTED_LLM: Optional[BaseLLM] = None
 SELECTED_MODEL_PATH: Optional[str] = None  # Track path for LangChain
@@ -151,6 +152,10 @@ def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
             print("Invalid number.")
         except ValueError:
             print("Enter a number.")
+=======
+CHAT_HISTORY: List[Dict[str, str]] = []
+MEMORY_LOCK = asyncio.Lock()
+>>>>>>> origin/perf-async-save-memory-13542067766305551337
 
 # --- CLI CHARACTER SELECTION ---
 def select_character() -> Dict[str, Any]:
@@ -294,12 +299,19 @@ def load_memory() -> None:
     else:
         CHAT_HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-def save_memory() -> None:
+def _write_memory_to_disk(filename: str, history: List[Dict[str, str]]) -> None:
     try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(CHAT_HISTORY, f, indent=2)
+        with open(filename, "w") as f:
+            json.dump(history, f, indent=2)
     except Exception as e:
         logger.error(f"[MEMORY] Error saving memory: {e}")
+
+async def save_memory() -> None:
+    async with MEMORY_LOCK:
+        # Snapshot to ensure thread safety
+        history_snapshot = list(CHAT_HISTORY)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_memory_to_disk, MEMORY_FILE, history_snapshot)
 
 # --- CLI FLAGS ---
 if "--reset" in sys.argv:
@@ -538,6 +550,10 @@ async def ollama_show(req: Dict[str, Any]):
         ]
     }
 
+def read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
 async def process_agent_chat(user_text: str) -> str:
     """
     Shared logic to handle the agent's reasoning loop using LangGraph.
@@ -573,6 +589,7 @@ async def process_agent_chat(user_text: str) -> str:
         text = re.sub(r'\n\s*\n', '\n', text).strip()
         return text
     
+<<<<<<< HEAD
     try:
         result = agent_graph.invoke(
             {"messages": [HumanMessage(content=user_text)]},
@@ -593,6 +610,12 @@ async def process_agent_chat(user_text: str) -> str:
     except Exception as e:
         logger.error(f"Agent error: {e}")
         return "I encountered an error processing your request."
+=======
+    # Save History 
+    await save_memory()
+    
+    return response_text
+>>>>>>> origin/perf-async-save-memory-13542067766305551337
 
 @app.post("/chat")
 async def chat_endpoint(file: UploadFile = File(...)):
@@ -621,16 +644,16 @@ async def chat_endpoint(file: UploadFile = File(...)):
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    subprocess.run([
+    await asyncio.to_thread(subprocess.run, [
         "say",
         "-v", MAC_VOICE,
         "-o", output_file,
         "--data-format=LEF32@22050",
         final_response
-    ])
+    )
+    await proc.wait()
 
-    with open(output_file, "rb") as f:
-        wav_data = f.read()
+    wav_data = await asyncio.to_thread(read_file_bytes, output_file)
 
     return Response(content=wav_data, media_type="audio/wav")
 
