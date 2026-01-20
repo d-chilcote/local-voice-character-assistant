@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 # --- GLOBAL STATE ---
 CURRENT_CHAR = None
 CHAT_HISTORY: List[Dict[str, str]] = []
+MEMORY_LOCK = asyncio.Lock()
 
 # --- CLI CHARACTER SELECTION ---
 def select_character() -> Dict[str, Any]:
@@ -135,12 +136,19 @@ def load_memory() -> None:
     else:
         CHAT_HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-def save_memory() -> None:
+def _write_memory_to_disk(filename: str, history: List[Dict[str, str]]) -> None:
     try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(CHAT_HISTORY, f, indent=2)
+        with open(filename, "w") as f:
+            json.dump(history, f, indent=2)
     except Exception as e:
         logger.error(f"[MEMORY] Error saving memory: {e}")
+
+async def save_memory() -> None:
+    async with MEMORY_LOCK:
+        # Snapshot to ensure thread safety
+        history_snapshot = list(CHAT_HISTORY)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _write_memory_to_disk, MEMORY_FILE, history_snapshot)
 
 # --- CLI FLAGS ---
 if "--reset" in sys.argv:
@@ -380,7 +388,7 @@ async def process_agent_chat(user_text: str) -> str:
     response_text, CHAT_HISTORY = agent.chat(user_text, CHAT_HISTORY)
     
     # Save History 
-    save_memory()
+    await save_memory()
     
     return response_text
 
