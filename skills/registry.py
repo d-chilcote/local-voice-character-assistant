@@ -21,6 +21,7 @@ class SkillRegistry:
     def __init__(self, skills_dir: str = "skills"):
         self.skills_dir = os.path.join(os.getcwd(), skills_dir)
         self._skills: Dict[str, SkillMetadata] = {}
+        self._module_cache: Dict[str, Any] = {}
         self.discover_skills()
 
     def discover_skills(self) -> None:
@@ -137,9 +138,13 @@ class SkillRegistry:
     def _run_script(self, script_path: str, **kwargs) -> Optional[str]:
         """Runs a python script dynamically."""
         try:
-            spec = importlib.util.spec_from_file_location("skill_module", script_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            if script_path in self._module_cache:
+                module = self._module_cache[script_path]
+            else:
+                spec = importlib.util.spec_from_file_location("skill_module", script_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self._module_cache[script_path] = module
             
             # Convention: each script should have an execute or execute_search function
             # To be flexible, we can look for 'execute_search' or generic 'execute'
