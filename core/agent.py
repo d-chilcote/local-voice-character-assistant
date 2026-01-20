@@ -25,6 +25,14 @@ class Agent:
         self.llm = llm
         self.registry = registry
         self.config = config or {}
+        # Pre-compute system prompt with skills
+        self._cached_full_system_prompt = None
+
+    def _get_full_system_prompt(self) -> str:
+        if self._cached_full_system_prompt is None:
+            skill_info = self.registry.get_skill_instructions()
+            self._cached_full_system_prompt = f"{self.system_prompt}\n\n{skill_info}" if skill_info else self.system_prompt
+        return self._cached_full_system_prompt
 
     def chat(self, user_text: str, history: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
         """
@@ -69,15 +77,16 @@ class Agent:
 
     def _ensure_system_prompt(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Ensures the system prompt contains the latest skills."""
-        skill_info = self.registry.get_skill_instructions()
-        full_system_prompt = f"{self.system_prompt}\n\n{skill_info}" if skill_info else self.system_prompt
+        full_system_prompt = self._get_full_system_prompt()
         
         if not history:
             return [{"role": "system", "content": full_system_prompt}]
         
         # Update existing system prompt if present
         if history[0]["role"] == "system":
-            history[0]["content"] = full_system_prompt
+            # Optimization: only update if different
+            if history[0]["content"] != full_system_prompt:
+                history[0]["content"] = full_system_prompt
         else:
             # Insert if missing (rare case)
             history.insert(0, {"role": "system", "content": full_system_prompt})
