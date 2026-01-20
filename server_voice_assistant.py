@@ -377,7 +377,7 @@ async def process_agent_chat(user_text: str) -> str:
     global CHAT_HISTORY
     
     # Delegate to Agent
-    response_text, CHAT_HISTORY = agent.chat(user_text, CHAT_HISTORY)
+    response_text, CHAT_HISTORY = await agent.chat(user_text, CHAT_HISTORY)
     
     # Save History 
     save_memory()
