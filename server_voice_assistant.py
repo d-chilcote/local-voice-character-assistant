@@ -370,6 +370,10 @@ async def ollama_show(req: Dict[str, Any]):
         ]
     }
 
+def read_file_bytes(path: str) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
 async def process_agent_chat(user_text: str) -> str:
     """
     Shared logic to handle the agent's reasoning loop for both audio and text.
@@ -411,7 +415,7 @@ async def chat_endpoint(file: UploadFile = File(...)):
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    subprocess.run([
+    await asyncio.to_thread(subprocess.run, [
         "say",
         "-v", MAC_VOICE,
         "-o", output_file,
@@ -419,8 +423,7 @@ async def chat_endpoint(file: UploadFile = File(...)):
         final_response
     ])
 
-    with open(output_file, "rb") as f:
-        wav_data = f.read()
+    wav_data = await asyncio.to_thread(read_file_bytes, output_file)
 
     return Response(content=wav_data, media_type="audio/wav")
 
