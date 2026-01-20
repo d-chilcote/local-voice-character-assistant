@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 import json
 from typing import List, Dict, Any, Optional, Tuple
@@ -25,8 +26,16 @@ class Agent:
         self.llm = llm
         self.registry = registry
         self.config = config or {}
+        # Pre-compute system prompt with skills
+        self._cached_full_system_prompt = None
 
-    def chat(self, user_text: str, history: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
+    def _get_full_system_prompt(self) -> str:
+        if self._cached_full_system_prompt is None:
+            skill_info = self.registry.get_skill_instructions()
+            self._cached_full_system_prompt = f"{self.system_prompt}\n\n{skill_info}" if skill_info else self.system_prompt
+        return self._cached_full_system_prompt
+
+    async def chat(self, user_text: str, history: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
         """
         Processes a user message and returns the assistant's verbal response
         and the updated history.
@@ -46,7 +55,7 @@ class Agent:
         history.append({"role": "user", "content": user_text})
         
         # 2. Think (Step 1: Plan/Decide)
-        response_1 = self._llm_json_completion(history)
+        response_1 = await self._llm_json_completion(history)
         
         thought = response_1.get("thought", "No thought provided.")
         action = response_1.get("call_to_action", "reply")
@@ -58,7 +67,7 @@ class Agent:
 
         # 3. Act (Skill Loop)
         if action and action not in ["reply", "none"]:
-             final_response = self._handle_action(action, response_1, history)
+             final_response = await self._handle_action(action, response_1, history)
         else:
              logger.info(f"{self.name}: {final_response}")
 
@@ -69,22 +78,23 @@ class Agent:
 
     def _ensure_system_prompt(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Ensures the system prompt contains the latest skills."""
-        skill_info = self.registry.get_skill_instructions()
-        full_system_prompt = f"{self.system_prompt}\n\n{skill_info}" if skill_info else self.system_prompt
+        full_system_prompt = self._get_full_system_prompt()
         
         if not history:
             return [{"role": "system", "content": full_system_prompt}]
         
         # Update existing system prompt if present
         if history[0]["role"] == "system":
-            history[0]["content"] = full_system_prompt
+            # Optimization: only update if different
+            if history[0]["content"] != full_system_prompt:
+                history[0]["content"] = full_system_prompt
         else:
             # Insert if missing (rare case)
             history.insert(0, {"role": "system", "content": full_system_prompt})
             
         return history
 
-    def _handle_action(self, action: str, ai_data: Dict[str, Any], history: List[Dict[str, str]]) -> str:
+    async def _handle_action(self, action: str, ai_data: Dict[str, Any], history: List[Dict[str, str]]) -> str:
         """Executes a skill and performs the follow-up generation."""
         # Normalize action name (handle 'search' alias)
         target_action = "google_search" if action in ["search", "google_search"] else action
@@ -142,16 +152,17 @@ class Agent:
             )
             temp_history.append({"role": "user", "content": new_content})
             
-        response_2 = self._llm_json_completion(temp_history)
+        response_2 = await self._llm_json_completion(temp_history)
         final_speech = response_2.get("speech", "Error generating speech.")
         
         logger.info(f"{self.name} (With Skill Result): {final_speech}")
         return final_speech
 
-    def _llm_json_completion(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    async def _llm_json_completion(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """Wrapper for LLM JSON generation."""
         try:
-            response = self.llm.create_chat_completion(
+            response = await asyncio.to_thread(
+                self.llm.create_chat_completion,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=300,

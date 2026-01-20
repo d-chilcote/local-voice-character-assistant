@@ -9,11 +9,12 @@ logger = get_logger(__name__)
 
 class SkillMetadata:
     """Holds metadata for an AgentSkill."""
-    def __init__(self, name: str, description: str, path: str, instructions: str):
+    def __init__(self, name: str, description: str, path: str, instructions: str, target_script: Optional[str] = None):
         self.name = name
         self.description = description
         self.path = path
         self.instructions = instructions
+        self.target_script = target_script
 
 class SkillRegistry:
     """Registry for discovering and managing AgentSkills."""
@@ -21,6 +22,7 @@ class SkillRegistry:
     def __init__(self, skills_dir: str = "skills"):
         self.skills_dir = os.path.join(os.getcwd(), skills_dir)
         self._skills: Dict[str, SkillMetadata] = {}
+        self._module_cache: Dict[str, Any] = {}
         self.discover_skills()
 
     def discover_skills(self) -> None:
@@ -52,7 +54,9 @@ class SkillRegistry:
             name = metadata.get("name") or os.path.basename(skill_path)
             description = metadata.get("description", "No description provided.")
 
-            self._skills[name] = SkillMetadata(name, description, skill_path, instructions)
+            target_script = self._resolve_script_path(skill_path)
+
+            self._skills[name] = SkillMetadata(name, description, skill_path, instructions, target_script)
             logger.info(f"Discovered skill: {name}")
 
             # Check for dependencies
@@ -62,6 +66,25 @@ class SkillRegistry:
 
         except Exception as e:
             logger.error(f"Error loading skill at {skill_path}: {e}")
+
+    def _resolve_script_path(self, skill_path: str) -> Optional[str]:
+        """Resolves the primary python script for a skill."""
+        script_dir = os.path.join(skill_path, "scripts")
+        if not os.path.exists(script_dir):
+            return None
+
+        # Prefer search.py or main.py or the first .py script
+        candidates = ["search.py", "main.py", "run.py"]
+        for candidate in candidates:
+            p = os.path.join(script_dir, candidate)
+            if os.path.exists(p):
+                return p
+
+        for file in os.listdir(script_dir):
+            if file.endswith(".py"):
+                return os.path.join(script_dir, file)
+
+        return None
 
     def _parse_metadata(self, content: str) -> Dict[str, str]:
         """Parses metadata from YAML frontmatter or Markdown tables."""
@@ -105,41 +128,25 @@ class SkillRegistry:
             logger.error(f"Skill '{skill_name}' not found.")
             return None
 
-        script_dir = os.path.join(meta.path, "scripts")
-        if not os.path.exists(script_dir):
-            logger.error(f"No scripts directory for skill '{skill_name}'")
-            return None
-
-        # Prefer search.py or main.py or the first .py script
-        candidates = ["search.py", "main.py", "run.py"]
-        target_script = None
-        for candidate in candidates:
-            p = os.path.join(script_dir, candidate)
-            if os.path.exists(p):
-                target_script = p
-                break
-        
-        if not target_script:
-            for file in os.listdir(script_dir):
-                if file.endswith(".py"):
-                    target_script = os.path.join(script_dir, file)
-                    break
-        
-        if not target_script:
+        if not meta.target_script:
             logger.error(f"No python script found for skill '{skill_name}'")
             return None
 
         # Strategy 1: Subprocess (Safe, consistent with Anthropic/AgentSkills CLI usage)
         # Strategy 2: Import (Fast, better for local server integration)
         # We'll stick to Import for our own skills, but could fallback to subprocess if import fails.
-        return self._run_script(target_script, **kwargs)
+        return self._run_script(meta.target_script, **kwargs)
 
     def _run_script(self, script_path: str, **kwargs) -> Optional[str]:
         """Runs a python script dynamically."""
         try:
-            spec = importlib.util.spec_from_file_location("skill_module", script_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            if script_path in self._module_cache:
+                module = self._module_cache[script_path]
+            else:
+                spec = importlib.util.spec_from_file_location("skill_module", script_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                self._module_cache[script_path] = module
             
             # Convention: each script should have an execute or execute_search function
             # To be flexible, we can look for 'execute_search' or generic 'execute'
