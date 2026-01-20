@@ -29,7 +29,8 @@ class MockLLM:
             }]
         }
 
-def test_memory_erasure_skill(tmp_path):
+@pytest.mark.asyncio
+async def test_memory_erasure_skill(tmp_path):
     # 1. Setup
     memory_file = tmp_path / "test_memory.json"
     
@@ -71,7 +72,7 @@ def test_memory_erasure_skill(tmp_path):
     # But wait, the Agent usually loads history from file? No, it takes it as arg.
     in_memory_history = list(history)
     
-    agent.chat("Erase your memory", in_memory_history)
+    await agent.chat("Erase your memory", in_memory_history)
     
     # 3. Verify
     # Check that registry.execute_skill was called with correct args
@@ -100,9 +101,10 @@ def test_memory_erasure_skill(tmp_path):
     # Check File Deleted
     assert not os.path.exists(memory_file)
     
-    # Check History Cleared (except system)
-    assert len(test_history) == 1
+    # Check History Cleared (except system and trigger)
+    assert len(test_history) == 2
     assert test_history[0]["role"] == "system"
+    assert test_history[1]["role"] == "user"
     assert "cleared" in result
 
 if __name__ == "__main__":

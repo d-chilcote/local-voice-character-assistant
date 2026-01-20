@@ -32,24 +32,26 @@ import os
 # And 'server_voice_assistant.Agent'
 
 with patch("subprocess.run") as mock_run, \
-     patch("core.agent.Agent") as mock_agent_cls, \
+     patch("core.agent_graph.create_agent_graph") as mock_create_graph, \
      patch("logger_config.setup_logging"):
 
     # Configure mock run for get_voice
     mock_run.return_value.returncode = 0
 
-    # Configure mock agent
-    mock_agent_instance = MagicMock()
-    mock_agent_instance.chat.return_value = ("Hello world", [])
-    mock_agent_cls.return_value = mock_agent_instance
+    # Configure mock agent graph
+    mock_agent_graph = AsyncMock()
+    mock_create_graph.return_value = mock_agent_graph
 
     import server_voice_assistant
 
 @pytest.mark.asyncio
 async def test_chat_endpoint_uses_async_subprocess():
     # Setup
-    server_voice_assistant.whisper.transcribe.return_value = ([MagicMock(text="Hello")], None)
-    server_voice_assistant.agent.chat.return_value = ("Response text", [])
+    # Mock agent_graph invoke result
+    server_voice_assistant.agent_graph.ainvoke = AsyncMock()
+    server_voice_assistant.agent_graph.ainvoke.return_value = {
+        "messages": [MagicMock(content="Response text")]
+    }
 
     # Mock UploadFile
     mock_file = AsyncMock()
@@ -58,12 +60,14 @@ async def test_chat_endpoint_uses_async_subprocess():
     # Mock asyncio.create_subprocess_exec
     with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec, \
          patch("builtins.open", new_callable=MagicMock) as mock_open, \
-         patch("os.path.exists", return_value=False), \
-         patch("os.remove"):
+         patch("server_voice_assistant.os.path.exists", return_value=True), \
+         patch("server_voice_assistant.os.remove"):
 
         # Configure the process mock
         mock_proc = AsyncMock()
         mock_proc.wait.return_value = None
+        mock_proc.communicate.return_value = (b"", b"")
+        mock_proc.returncode = 0
         mock_exec.return_value = mock_proc
 
         # Configure file read
@@ -80,8 +84,8 @@ async def test_chat_endpoint_uses_async_subprocess():
         assert args[0][0] == "say"
         assert "Response text" in args[0]
 
-        # Verify we waited for the process
-        assert mock_proc.wait.called
+        # Verify we communicated with the process
+        assert mock_proc.communicate.called
 
         # Verify response
         assert response.body == b"wav data"

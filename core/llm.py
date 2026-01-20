@@ -1,7 +1,6 @@
 import json
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
-from llama_cpp import Llama
 from logger_config import get_logger
 from config import cfg
 
@@ -42,6 +41,7 @@ class LlamaCPPLLM(BaseLLM):
         self.default_inference_params = default_inference_params or {}
         self.extra_config = extra_config or {}
         
+        from llama_cpp import Llama
         # chat_format="jinja" specifically for model templates if needed
         self.llm = Llama(
             model_path=model_path,

@@ -1,6 +1,6 @@
 import pytest
 import json
-from server_robot import clean_response_text, update_chat_history, SYSTEM_PROMPT
+from legacy.server_robot import clean_response_text, update_chat_history, SYSTEM_PROMPT
 
 # 1. System Prompt Schema Validation
 def test_system_prompt_has_json_instruction():

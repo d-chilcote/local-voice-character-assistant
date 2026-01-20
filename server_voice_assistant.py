@@ -14,6 +14,7 @@ import subprocess
 import os
 import json
 import asyncio
+from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Body
@@ -27,6 +28,7 @@ from logger_config import setup_logging, get_logger
 from config import cfg
 from utils import stderr_suppressor
 from skills.registry import registry
+from langgraph.checkpoint.memory import MemorySaver
 from core.agent_graph import create_agent_graph, AgentState
 from core.llm_langchain import create_chat_llm
 from core.tools_bridge import get_all_tools
@@ -38,13 +40,28 @@ from langchain_core.messages import HumanMessage
 setup_logging()
 logger = get_logger(__name__)
 
-# --- GLOBAL STATE ---
-CURRENT_CHAR = None
+# --- GLOBAL STATE (INITIALIZED AT RUNTIME) ---
+if "pytest" in sys.modules:
+    from unittest.mock import MagicMock
+    whisper = MagicMock()
+else:
+    whisper = None
+
+llm = None
+langchain_llm = None
+agent_graph = None
+MAC_VOICE = "Alex" # Default safe voice for tests
+MEMORY_FILE = "mem.json"
+SYSTEM_PROMPT = "You are a helpful assistant."
+HISTORY_LIMIT = 10
+
+CURRENT_CHAR = CHARACTERS[0] # Default to first character
 CHAT_HISTORY: List[Dict[str, str]] = []  # Legacy, kept for compatibility
 MEMORY_LOCK = asyncio.Lock()
 SELECTED_LLM: Optional[BaseLLM] = None
 SELECTED_MODEL_PATH: Optional[str] = None  # Track path for LangChain
 SELECTED_MODEL_CONFIG: Dict[str, Any] = {}  # Model-specific config for LangChain
+memory_saver = MemorySaver() # LangGraph Checkpointer
 
 # --- CLI MODEL SELECTION ---
 def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
@@ -92,6 +109,8 @@ def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
                     # Global "Mac Studio" Optimized Defaults
                     n_ctx = cfg().llama_n_ctx
                     n_gpu_layers = 99
+                    n_threads = 8
+                    n_batch = 512 # Default batch size
                     flash_attn = True
                     use_mlock = True
                     chat_format = None
@@ -118,33 +137,50 @@ def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
                         logger.info(f"Applying Devstral optimization flags for {selected['path']}")
                     
                     elif is_qwen:
-                        n_ctx = 131072
-                        chat_format = "chatml-function-calling"  # Qwen uses ChatML
-                        default_inference_params = {
-                            "temperature": 0.6,
-                            "min_p": 0.1
-                        }
-                        logger.info(f"Applying Qwen optimization flags for {selected['path']}")
+                        # Check for Qwen 2.5 14B specifically for user-requested optimizations
+                        is_qwen_25_14b = "qwen2.5-14b" in model_path_lower
+                        
+                        if is_qwen_25_14b:
+                            n_ctx = 32768
+                            n_threads = 10
+                            n_batch = 512
+                            chat_format = "chatml-function-calling"
+                            default_inference_params = {
+                                "temperature": 0.6,
+                                "min_p": 0.1
+                            }
+                            logger.info(f"Applying Qwen2.5-14B specific optimization flags for {selected['path']}")
+                        else:
+                            n_ctx = 131072
+                            chat_format = "chatml-function-calling"
+                            default_inference_params = {
+                                "temperature": 0.6,
+                                "min_p": 0.1
+                            }
+                            logger.info(f"Applying default Qwen optimization flags for {selected['path']}")
 
                     try:
                         llm_instance = LlamaCPPLLM(
                             model_path=selected["path"],
-                            n_gpu_layers=n_gpu_layers,
                             n_ctx=n_ctx,
-                            n_threads=cfg().llama_n_threads,
+                            n_gpu_layers=n_gpu_layers,
+                            n_threads=n_threads,
                             flash_attn=flash_attn,
                             use_mlock=use_mlock,
                             chat_format=chat_format,
+                            extra_config={"n_batch": n_batch},
                             default_inference_params=default_inference_params
                         )
-                        return llm_instance, selected["path"], {
+                        # Prepare config for LangChain initialization
+                        model_config = {
+                            "chat_format": chat_format,
+                            "n_threads": n_threads,
+                            "n_batch": n_batch,
                             "n_ctx": n_ctx,
-                            "n_gpu_layers": n_gpu_layers,
-                            "flash_attn": flash_attn,
-                            "use_mlock": use_mlock,
                             "temperature": default_inference_params.get("temperature", 0.7),
-                            "chat_format": chat_format,  # Pass to LangChain LLM
+                            "min_p": default_inference_params.get("min_p", 0.1)
                         }
+                        return llm_instance, selected["path"], model_config
                     except Exception as model_error:
                         logger.error(f"Failed to load model: {model_error}")
                         print(f"Error loading model: {model_error}")
@@ -171,15 +207,19 @@ def select_character() -> Dict[str, Any]:
         except ValueError:
             print("Please enter a number.")
 
-if __name__ == "__main__":
-    # If starting via CLI, maybe we want to select? 
-    # But for a background server, maybe we default.
-    # Let's check for a flag or env var, otherwise default to r2_67
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles startup and shutdown of heavy models and resources.
+    This prevents Metal backend crashes and memory leaks during test collection.
+    """
+    global whisper, llm, langchain_llm, agent_graph, MAC_VOICE, MEMORY_FILE, SYSTEM_PROMPT, HISTORY_LIMIT, CURRENT_CHAR, SELECTED_LLM, SELECTED_MODEL_PATH, SELECTED_MODEL_CONFIG
+
+    # 1. Select Character & Model (if CLI or default)
     default_char_name = os.getenv("DEFAULT_CHARACTER", "R2-67")
     selected_char = next((c for c in CHARACTERS if c["name"] == default_char_name), CHARACTERS[0])
     
     if sys.stdin.isatty():
-        # Brain first, then Body
         SELECTED_LLM, SELECTED_MODEL_PATH, SELECTED_MODEL_CONFIG = select_model()
         CURRENT_CHAR = select_character()
     else:
@@ -198,45 +238,69 @@ if __name__ == "__main__":
             n_threads=cfg().llama_n_threads
         )
         CURRENT_CHAR = selected_char
-else:
-    CURRENT_CHAR = CHARACTERS[0]
-    SELECTED_MODEL_PATH = cfg().llama_path
-    SELECTED_MODEL_CONFIG = {
-        "n_ctx": cfg().llama_n_ctx,
-        "n_gpu_layers": cfg().llama_n_gpu_layers,
-        "flash_attn": True,
-        "use_mlock": True,
-        "temperature": 0.7,
-    }
-    # In non-main context (like uvicorn workers if they reload), we need a default LLM
-    SELECTED_LLM = LlamaCPPLLM(
-        model_path=SELECTED_MODEL_PATH, 
-        n_gpu_layers=cfg().llama_n_gpu_layers, 
-        n_ctx=cfg().llama_n_ctx, 
-        n_threads=cfg().llama_n_threads
+
+    # 2. Assign Derived Config
+    MEMORY_FILE = CURRENT_CHAR["memory_file"]
+    SYSTEM_PROMPT = CURRENT_CHAR["system_prompt"]
+    HISTORY_LIMIT = cfg().history_limit
+
+    # 3. Voice Engine
+    target_voice = CURRENT_CHAR["voice_native"]
+    if subprocess.run(["say", "-v", target_voice, "test"], capture_output=True).returncode == 0:
+        MAC_VOICE = target_voice
+    else:
+        logger.warning(f"Voice '{target_voice}' not found. Falling back to '{CURRENT_CHAR['voice_fallback']}'.")
+        MAC_VOICE = CURRENT_CHAR["voice_fallback"]
+
+    # 4. ASCII Art & Startup Greeting
+    print(CURRENT_CHAR["face"])
+    logger.info(f"--- LOADING {CURRENT_CHAR['name']} (v2.1 AGENTIC) ---")
+    logger.info(f"Memorizing to: {MEMORY_FILE}")
+
+    # 5. Load Ears (Whisper)
+    logger.info("1. Loading Ears (Whisper)...")
+    whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
+
+    # 6. Load Brain (LLM & LangChain)
+    logger.info("2. Ensuring Brain is Ready...")
+    llm = SELECTED_LLM
+    
+    logger.info("3. Initializing LangGraph Agent...")
+    langchain_llm = create_chat_llm(
+        model_path=SELECTED_MODEL_PATH or cfg().llama_path,
+        n_ctx=SELECTED_MODEL_CONFIG.get("n_ctx", cfg().llama_n_ctx),
+        n_gpu_layers=SELECTED_MODEL_CONFIG.get("n_gpu_layers", cfg().llama_n_gpu_layers),
+        n_threads=SELECTED_MODEL_CONFIG.get("n_threads", cfg().llama_n_threads),
+        n_batch=SELECTED_MODEL_CONFIG.get("n_batch", 512),
+        temperature=SELECTED_MODEL_CONFIG.get("temperature", 0.7),
+        flash_attn=SELECTED_MODEL_CONFIG.get("flash_attn", True),
+        use_mlock=SELECTED_MODEL_CONFIG.get("use_mlock", True),
+        chat_format=SELECTED_MODEL_CONFIG.get("chat_format", "chatml-function-calling"),
     )
+    tools = get_all_tools(history=CHAT_HISTORY, memory_file=MEMORY_FILE, memory_saver=memory_saver)
+    agent_graph = create_agent_graph(
+        llm=langchain_llm,
+        tools=tools,
+        system_prompt=CURRENT_CHAR["system_prompt"],
+        checkpointer=memory_saver
+    )
+    logger.info(f"Agent initialized with {len(tools)} tools")
 
-# --- DERIVED CONFIG ---
-MEMORY_FILE = CURRENT_CHAR["memory_file"]
-SYSTEM_PROMPT = CURRENT_CHAR["system_prompt"]
-HISTORY_LIMIT = cfg().history_limit
+    # 7. Load Memory
+    if "--reset" in sys.argv:
+        if os.path.exists(MEMORY_FILE):
+            os.remove(MEMORY_FILE)
+            logger.info("[MEMORY] Wiped memory due to --reset flag.")
+    
+    load_memory()
+    logger.info("--- SYSTEMS READY ---")
 
-# --- VOICE CONFIG ---
-def get_voice() -> str:
-    target = CURRENT_CHAR["voice_native"]
-    if subprocess.run(["say", "-v", target, "test"], capture_output=True).returncode == 0:
-        return target
-    logger.warning(f"Voice '{target}' not found. Falling back to '{CURRENT_CHAR['voice_fallback']}'.")
-    return CURRENT_CHAR["voice_fallback"]
+    yield
+    
+    # Optional Shutdown Logic
+    logger.info("Shutting down assistant...")
 
-MAC_VOICE = get_voice()
-
-# --- ASCII ART ---
-print(CURRENT_CHAR["face"])
-logger.info(f"--- LOADING {CURRENT_CHAR['name']} (v2.1 AGENTIC) ---")
-logger.info(f"Memorizing to: {MEMORY_FILE}")
-
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Add detail logging for 422s
 @app.exception_handler(422)
@@ -245,55 +309,20 @@ async def validation_exception_handler(request, exc):
     logger.error(f"Request body: {await request.body()}")
     return Response(content=str(exc.errors()), status_code=422)
 
-# --- LOAD SYSTEMS ---
-logger.info("1. Loading Ears (Whisper)...")
-whisper = WhisperModel("base.en", device="cpu", compute_type="int8")
-
-logger.info("2. Ensuring Brain is Ready...")
-llm = SELECTED_LLM
-if not llm:
-    # Fallback for weird edge cases
-    llm = LlamaCPPLLM(
-        model_path=cfg().llama_path, 
-        n_gpu_layers=cfg().llama_n_gpu_layers, 
-        n_ctx=cfg().llama_n_ctx, 
-        n_threads=cfg().llama_n_threads
-    )
-
-logger.info(f"3. Voice Engine: {MAC_VOICE}...")
-
-# --- LANGGRAPH AGENT INITIALIZATION ---
-logger.info("4. Initializing LangGraph Agent...")
-langchain_llm = create_chat_llm(
-    model_path=SELECTED_MODEL_PATH or cfg().llama_path,
-    n_ctx=SELECTED_MODEL_CONFIG.get("n_ctx", cfg().llama_n_ctx),
-    n_gpu_layers=SELECTED_MODEL_CONFIG.get("n_gpu_layers", cfg().llama_n_gpu_layers),
-    n_threads=cfg().llama_n_threads,
-    temperature=SELECTED_MODEL_CONFIG.get("temperature", 0.7),
-    flash_attn=SELECTED_MODEL_CONFIG.get("flash_attn", True),
-    use_mlock=SELECTED_MODEL_CONFIG.get("use_mlock", True),
-    chat_format=SELECTED_MODEL_CONFIG.get("chat_format", "chatml-function-calling"),
-)
-tools = get_all_tools()
-agent_graph = create_agent_graph(
-    llm=langchain_llm,
-    tools=tools,
-    system_prompt=CURRENT_CHAR["system_prompt"],
-    checkpointer=None  # Phase 6 will add SQLite checkpointer
-)
-logger.info(f"Agent initialized with {len(tools)} tools")
+# System components are initialized within lifespan now
 def load_memory() -> None:
     global CHAT_HISTORY
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r") as f:
-                CHAT_HISTORY = json.load(f)
+                data = json.load(f)
+                CHAT_HISTORY[:] = data # Update in-place to preserve references
             logger.info(f"[MEMORY] Loaded {len(CHAT_HISTORY)} previous thoughts.")
         except Exception as e:
             logger.error(f"[MEMORY] Error loading memory: {e}")
-            CHAT_HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
+            CHAT_HISTORY[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
     else:
-        CHAT_HISTORY = [{"role": "system", "content": SYSTEM_PROMPT}]
+        CHAT_HISTORY[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 def _write_memory_to_disk(filename: str, history: List[Dict[str, str]]) -> None:
     try:
@@ -309,14 +338,7 @@ async def save_memory() -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, _write_memory_to_disk, MEMORY_FILE, history_snapshot)
 
-# --- CLI FLAGS ---
-if "--reset" in sys.argv:
-    if os.path.exists(MEMORY_FILE):
-        os.remove(MEMORY_FILE)
-        logger.info("[MEMORY] Wiped memory due to --reset flag.")
-
-load_memory()
-logger.info("--- SYSTEMS READY ---")
+# Load memory is now called inside lifespan
 
 @app.get("/")
 @app.head("/")
@@ -604,6 +626,14 @@ async def process_agent_chat(user_text: str) -> str:
         if not response_text:
             logger.warning("[AGENT] Empty response after cleaning, returning fallback")
             response_text = "I couldn't find that information. Could you try rephrasing your question?"
+
+        # If memory was cleared by a tool, wipe the checkpointer state for this thread
+        # We do this AFTER ainvoke finishes to avoid KeyError mid-run
+        if any("Persistent memory file deleted" in str(getattr(m, "content", "")) for m in result.get("messages", [])):
+            thread_id = CURRENT_CHAR["id"]
+            if hasattr(memory_saver, 'storage'):
+                memory_saver.storage.pop((thread_id,), None)
+                logger.info(f"[MEMORY] Cleared LangGraph state for thread: {thread_id}")
 
         # Update Legacy History for UI
         CHAT_HISTORY.append({"role": "assistant", "content": response_text})

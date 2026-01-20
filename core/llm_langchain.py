@@ -3,9 +3,9 @@
 Provides a factory function to create ChatLlamaCpp instances
 with consistent configuration for tool-calling support.
 """
-from typing import Optional, Dict, Any
-
-from langchain_community.chat_models import ChatLlamaCpp
+from typing import Optional, Dict, Any, TYPE_CHECKING
+if TYPE_CHECKING:
+    from langchain_community.chat_models import ChatLlamaCpp
 
 from logger_config import get_logger
 
@@ -24,7 +24,7 @@ def create_chat_llm(
     verbose: bool = False,
     chat_format: Optional[str] = "chatml-function-calling",
     **kwargs
-) -> ChatLlamaCpp:
+) -> Any:
     """
     Factory for ChatLlamaCpp with tool-calling support.
     
@@ -51,6 +51,8 @@ def create_chat_llm(
         f"chat_format={chat_format}, max_tokens={max_tokens})"
     )
     
+    from langchain_community.chat_models import ChatLlamaCpp
+
     return ChatLlamaCpp(
         model_path=model_path,
         n_ctx=n_ctx,

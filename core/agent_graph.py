@@ -4,7 +4,8 @@ Provides a factory function to create a compiled LangGraph agent
 that follows the Think → Act → Observe → Reply loop.
 """
 import re
-from typing import TypedDict, Annotated, List, Optional
+from datetime import datetime
+from typing import TypedDict, Annotated, List, Optional, Dict, Any
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -25,17 +26,24 @@ class AgentState(TypedDict):
     messages: Annotated[List, add_messages]
 
 
-def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optional[dict]:
-    """
-    Fallback parser: Extract tool call from Qwen3's <tool_call> JSON format.
-    
-    Qwen3 outputs tool calls in format:
-    <tool_call>
-    {"name": "function_name", "arguments": {"arg1": "value1"}}
-    </tool_call>
-    
-    Returns dict with 'name' and 'args' if a tool call is detected, None otherwise.
-    """
+def find_json_block(text: str) -> Optional[str]:
+    """Finds the first complete JSON object in a string using brace counting."""
+    start = text.find('{')
+    if start == -1:
+        return None
+        
+    brace_count = 0
+    for i in range(start, len(text)):
+        if text[i] == '{':
+            brace_count += 1
+        elif text[i] == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                return text[start:i+1]
+    return None
+
+def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optional[Dict[str, Any]]:
+    """Manual parser for models that emit tool calls in text format."""
     if not content:
         return None
     
@@ -45,27 +53,17 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
         try:
             import json
             json_str = tool_call_match.group(1).strip()
-            # Handle multiple JSON objects by finding first complete one
-            brace_count = 0
-            json_end = 0
-            for i, char in enumerate(json_str):
-                if char == '{':
-                    brace_count += 1
-                elif char == '}':
-                    brace_count -= 1
-                    if brace_count == 0:
-                        json_end = i + 1
-                        break
-            if json_end > 0:
-                json_str = json_str[:json_end]
-            tool_data = json.loads(json_str)
-            tool_name = tool_data.get("name") or tool_data.get("function")
-            tool_args = tool_data.get("arguments") or tool_data.get("args") or tool_data.get("parameters") or {}
-            if tool_name and tool_name in available_tools:
-                logger.info(f"[PARSER] Extracted Qwen3 tool_call: {tool_name}({tool_args})")
-                return {"name": tool_name, "args": tool_args}
-        except json.JSONDecodeError as e:
-            logger.warning(f"[PARSER] Failed to parse tool_call JSON: {e}")
+            # Use our robust finder for the inner content
+            block = find_json_block(json_str)
+            if block:
+                tool_data = json.loads(block)
+                tool_name = tool_data.get("name") or tool_data.get("function")
+                tool_args = tool_data.get("arguments") or tool_data.get("args") or tool_data.get("parameters") or {}
+                if tool_name and tool_name in available_tools:
+                    logger.info(f"[PARSER] Extracted Qwen3 tool_call: {tool_name}({tool_args})")
+                    return {"name": tool_name, "args": tool_args}
+        except Exception as e:
+            logger.warning(f"[PARSER] Failed to parse Qwen3 tool_call JSON: {e}")
     
     # Second, try Nemotron's <function=X><parameter=Y> XML format
     # Format: <function=google_search>\n<parameter=query>\nvalue\n</parameter>\n</function>
@@ -81,6 +79,20 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
                 tool_args[param_name] = param_value.strip()
             logger.info(f"[PARSER] Extracted Nemotron function: {tool_name}({tool_args})")
             return {"name": tool_name, "args": tool_args}
+    
+    # Third, try raw JSON anywhere in the text (for Llama-3.1 behavior)
+    json_block = find_json_block(content)
+    if json_block:
+        try:
+            import json
+            tool_data = json.loads(json_block)
+            tool_name = tool_data.get("name") or tool_data.get("function")
+            tool_args = tool_data.get("arguments") or tool_data.get("args") or tool_data.get("parameters") or {}
+            if tool_name and tool_name in available_tools:
+                logger.info(f"[PARSER] Extracted embedded JSON tool_call: {tool_name}({tool_args})")
+                return {"name": tool_name, "args": tool_args}
+        except Exception:
+            pass
     
     
     # Fallback: ONLY use heuristic on first response (before any tool results)
@@ -156,8 +168,14 @@ def create_agent_graph(
         msgs = state["messages"]
         logger.info(f"[AGENT] Incoming messages count: {len(msgs)}")
         
+        current_date = datetime.now().strftime("%A, %B %d, %Y")
+        full_prompt = f"{system_prompt}\n\nCurrent Date: {current_date}"
+        
         if not msgs or not isinstance(msgs[0], SystemMessage):
-            msgs = [SystemMessage(content=system_prompt)] + list(msgs)
+            msgs = [SystemMessage(content=full_prompt)] + list(msgs)
+        else:
+            # Refresh personality and date
+            msgs[0] = SystemMessage(content=full_prompt)
         
         response = await llm_with_tools.ainvoke(msgs)
         
@@ -170,10 +188,7 @@ def create_agent_graph(
         logger.info(f"[AGENT] Native tool_calls: {native_calls}")
         
         # Fallback: parse tool calls from content if native is empty
-        # Check if we already have tool results in conversation
-        has_tool_result = any(isinstance(m, ToolMessage) for m in msgs)
-        
-        if not native_calls and response.content and tools and not has_tool_result:
+        if not native_calls and response.content and tools:
             parsed = parse_tool_call_from_text(response.content, tool_names)
             if parsed:
                 logger.info(f"[AGENT] Fallback parser found tool call: {parsed}")

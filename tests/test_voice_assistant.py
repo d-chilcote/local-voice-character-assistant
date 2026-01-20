@@ -193,7 +193,7 @@ def test_agent_graph_invoke_is_used():
     with open(source_path, 'r') as f:
         source_code = f.read()
     
-    assert "agent_graph.invoke" in source_code, "Server should use agent_graph.invoke"
+    assert "agent_graph.ainvoke" in source_code, "Server should use agent_graph.ainvoke"
 
 
 # =============================================================================
