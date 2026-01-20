@@ -3,66 +3,73 @@ import os
 import asyncio
 import pytest
 import subprocess
+import importlib
 from unittest.mock import MagicMock, patch, AsyncMock
 
-# Mock dependencies before importing the module
-sys.modules["llama_cpp"] = MagicMock()
-sys.modules["faster_whisper"] = MagicMock()
-sys.modules["soundfile"] = MagicMock()
-sys.modules["uvicorn"] = MagicMock()
-sys.modules["numpy"] = MagicMock()
+# Remove top-level sys.modules hacking to prevent pollution of other tests.
+# Instead, we use a fixture to patch dependencies and load the module.
 
-# Mock config and other modules
-sys.modules["logger_config"] = MagicMock()
-sys.modules["config"] = MagicMock()
-sys.modules["characters"] = MagicMock()
-sys.modules["utils"] = MagicMock()
-sys.modules["skills.registry"] = MagicMock()
-sys.modules["core.agent"] = MagicMock()
-sys.modules["utils.network"] = MagicMock()
+@pytest.fixture
+def app_module():
+    """
+    Fixture that mocks heavy dependencies and reloads server_voice_assistant
+    to ensure a clean state without side effects on other tests.
+    """
+    with patch.dict(sys.modules):
+        # Mock heavy dependencies
+        sys.modules["llama_cpp"] = MagicMock()
+        sys.modules["faster_whisper"] = MagicMock()
+        # sys.modules["soundfile"] = MagicMock() # Let's use real soundfile if installed, or mock if needed.
+        # Since I installed dependencies, I can skip mocking standard libs unless they are slow.
 
-# Setup mocks for what's used at module level
-mock_whisper_cls = MagicMock()
-sys.modules["faster_whisper"].WhisperModel = mock_whisper_cls
+        # We need to mock things that cause side effects at import time
 
-mock_llama_cls = MagicMock()
-sys.modules["llama_cpp"].Llama = mock_llama_cls
+        # Mock config
+        mock_cfg = MagicMock()
+        mock_cfg.return_value.history_limit = 10
+        mock_cfg.return_value.llama_path = "model.gguf"
+        # We need to patch config.cfg
 
-# Mock CHARACTERS
-sys.modules["characters"].CHARACTERS = [{"name": "TestChar", "voice_native": "Alex", "voice_fallback": "Fred", "memory_file": "mem.json", "system_prompt": "prompt", "face": ":)", "id": "test"}]
+        # We also need to patch subprocess.run because it's called at module level (get_voice)
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
 
-# Mock cfg
-mock_cfg = MagicMock()
-mock_cfg.return_value.history_limit = 10
-mock_cfg.return_value.llama_path = "model.gguf"
-sys.modules["config"].cfg = mock_cfg
+            # We need to patch setup_logging to avoid spam
+            with patch("logger_config.setup_logging"):
 
-# Mock utils
-sys.modules["utils"].stderr_suppressor = MagicMock()
+                # Ensure core.llm is reloaded to pick up the mocked llama_cpp
+                if "core.llm" in sys.modules:
+                    import core.llm
+                    importlib.reload(core.llm)
 
-# Mock subprocess.run for the import of server_voice_assistant
-original_run = subprocess.run
-mock_run = MagicMock()
-mock_run.return_value.returncode = 0
-subprocess.run = mock_run
+                # Import or reload
+                if "server_voice_assistant" in sys.modules:
+                    import server_voice_assistant
+                    importlib.reload(server_voice_assistant)
+                else:
+                    import server_voice_assistant
 
-try:
-    import server_voice_assistant
-finally:
-    pass
+                yield server_voice_assistant
 
 @pytest.mark.asyncio
-async def test_chat_endpoint_uses_async_subprocess():
+async def test_chat_endpoint_uses_async_subprocess(app_module):
     # Arrange
-    server_voice_assistant.whisper = MagicMock()
+    app_module.whisper = MagicMock()
     mock_segment = MagicMock()
     mock_segment.text = "Hello"
-    server_voice_assistant.whisper.transcribe.return_value = ([mock_segment], None)
+    app_module.whisper.transcribe.return_value = ([mock_segment], None)
 
-    server_voice_assistant.agent = MagicMock()
-    server_voice_assistant.agent.chat.return_value = ("Response Text", [])
+    # Mock the Agent Graph
+    mock_graph = AsyncMock()
+    app_module.agent_graph = mock_graph
 
-    subprocess.run.reset_mock()
+    # Mock result of ainvoke
+    mock_message = MagicMock()
+    mock_message.content = "Response Text"
+    mock_graph.ainvoke.return_value = {"messages": [mock_message]}
+
+    # Mock save_memory
+    app_module.save_memory = AsyncMock()
 
     with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_async_exec:
         mock_proc = AsyncMock()
@@ -84,7 +91,7 @@ async def test_chat_endpoint_uses_async_subprocess():
                 with patch("soundfile.read") as mock_sf_read:
                     mock_sf_read.return_value = (MagicMock(), 16000)
 
-                    response = await server_voice_assistant.chat_endpoint(file=mock_upload_file)
+                    response = await app_module.chat_endpoint(file=mock_upload_file)
 
                     assert mock_async_exec.called
                     args = mock_async_exec.call_args[0]
@@ -95,18 +102,24 @@ async def test_chat_endpoint_uses_async_subprocess():
                     assert response.status_code == 200
 
 @pytest.mark.asyncio
-async def test_chat_endpoint_handles_subprocess_failure():
+async def test_chat_endpoint_handles_subprocess_failure(app_module):
     # Arrange
-    server_voice_assistant.whisper = MagicMock()
+    app_module.whisper = MagicMock()
     mock_segment = MagicMock()
     mock_segment.text = "Hello"
-    server_voice_assistant.whisper.transcribe.return_value = ([mock_segment], None)
+    app_module.whisper.transcribe.return_value = ([mock_segment], None)
 
-    server_voice_assistant.agent = MagicMock()
-    server_voice_assistant.agent.chat.return_value = ("Response Text", [])
+    mock_graph = AsyncMock()
+    app_module.agent_graph = mock_graph
+    mock_message = MagicMock()
+    mock_message.content = "Response Text"
+    mock_graph.ainvoke.return_value = {"messages": [mock_message]}
+
+    # Mock save_memory
+    app_module.save_memory = AsyncMock()
 
     # Mock logger
-    server_voice_assistant.logger = MagicMock()
+    app_module.logger = MagicMock()
 
     with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_async_exec:
         mock_proc = AsyncMock()
@@ -123,15 +136,14 @@ async def test_chat_endpoint_handles_subprocess_failure():
              with patch("soundfile.read") as mock_sf_read:
                 mock_sf_read.return_value = (MagicMock(), 16000)
 
-                response = await server_voice_assistant.chat_endpoint(file=mock_upload_file)
+                response = await app_module.chat_endpoint(file=mock_upload_file)
 
                 assert response.status_code == 500
-                server_voice_assistant.logger.error.assert_called()
-                args = server_voice_assistant.logger.error.call_args[0]
-                assert "Speech synthesis failed" in args[0]
-
-if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    loop.run_until_complete(test_chat_endpoint_uses_async_subprocess())
-    loop.run_until_complete(test_chat_endpoint_handles_subprocess_failure())
-    print("Tests passed!")
+                app_module.logger.error.assert_called()
+                # Check that error was logged
+                found = False
+                for call in app_module.logger.error.call_args_list:
+                    if "Speech synthesis failed" in str(call):
+                        found = True
+                        break
+                assert found

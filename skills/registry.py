@@ -23,10 +23,12 @@ class SkillRegistry:
         self.skills_dir = os.path.join(os.getcwd(), skills_dir)
         self._skills: Dict[str, SkillMetadata] = {}
         self._module_cache: Dict[str, Any] = {}
+        self._cached_prompt: Optional[str] = None
         self.discover_skills()
 
     def discover_skills(self) -> None:
         """Scans the skills directory for subdirectories with SKILL.md."""
+        self._cached_prompt = None
         if not os.path.exists(self.skills_dir):
             logger.warning(f"Skills directory not found: {self.skills_dir}")
             return
@@ -111,6 +113,9 @@ class SkillRegistry:
     
     def get_skill_instructions(self) -> str:
         """Returns a combined string of all skill instructions for the LLM prompt."""
+        if self._cached_prompt is not None:
+            return self._cached_prompt
+
         if not self._skills:
             return ""
         
@@ -119,7 +124,8 @@ class SkillRegistry:
         for name, meta in self._skills.items():
             prompt_parts.append(f"--- SKILL: {name} ---\n{meta.instructions}\n")
         
-        return "\n".join(prompt_parts)
+        self._cached_prompt = "\n".join(prompt_parts)
+        return self._cached_prompt
 
     def execute_skill(self, skill_name: str, **kwargs) -> Optional[str]:
         """Executes a skill's primary script."""

@@ -151,7 +151,7 @@ def create_agent_graph(
     else:
         llm_with_tools = llm
     
-    def call_model(state: AgentState):
+    async def call_model(state: AgentState):
         """Node: Call the LLM with current messages."""
         msgs = state["messages"]
         logger.info(f"[AGENT] Incoming messages count: {len(msgs)}")
@@ -159,7 +159,7 @@ def create_agent_graph(
         if not msgs or not isinstance(msgs[0], SystemMessage):
             msgs = [SystemMessage(content=system_prompt)] + list(msgs)
         
-        response = llm_with_tools.invoke(msgs)
+        response = await llm_with_tools.ainvoke(msgs)
         
         # Log response details
         logger.info(f"[AGENT] Response type: {type(response).__name__}")
@@ -181,7 +181,7 @@ def create_agent_graph(
                 tool_func = tools_dict.get(parsed["name"])
                 if tool_func:
                     try:
-                        tool_result = tool_func.invoke(parsed["args"])
+                        tool_result = await tool_func.ainvoke(parsed["args"])
                         logger.info(f"[AGENT] Tool result: {str(tool_result)[:500]}...")
                         # Create a follow-up message with the result
                         return {
