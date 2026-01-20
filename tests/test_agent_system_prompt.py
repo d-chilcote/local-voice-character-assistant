@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import MagicMock
-from core.agent import Agent
+from core.agent_legacy import Agent
 
 class TestAgentSystemPrompt(unittest.TestCase):
     def setUp(self):

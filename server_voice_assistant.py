@@ -40,8 +40,8 @@ logger = get_logger(__name__)
 
 # --- GLOBAL STATE ---
 CURRENT_CHAR = None
-<<<<<<< HEAD
 CHAT_HISTORY: List[Dict[str, str]] = []  # Legacy, kept for compatibility
+MEMORY_LOCK = asyncio.Lock()
 SELECTED_LLM: Optional[BaseLLM] = None
 SELECTED_MODEL_PATH: Optional[str] = None  # Track path for LangChain
 SELECTED_MODEL_CONFIG: Dict[str, Any] = {}  # Model-specific config for LangChain
@@ -152,10 +152,6 @@ def select_model() -> tuple[BaseLLM, str, Dict[str, Any]]:
             print("Invalid number.")
         except ValueError:
             print("Enter a number.")
-=======
-CHAT_HISTORY: List[Dict[str, str]] = []
-MEMORY_LOCK = asyncio.Lock()
->>>>>>> origin/perf-async-save-memory-13542067766305551337
 
 # --- CLI CHARACTER SELECTION ---
 def select_character() -> Dict[str, Any]:
@@ -589,9 +585,11 @@ async def process_agent_chat(user_text: str) -> str:
         text = re.sub(r'\n\s*\n', '\n', text).strip()
         return text
     
-<<<<<<< HEAD
     try:
-        result = agent_graph.invoke(
+        # Update Legacy History for UI
+        CHAT_HISTORY.append({"role": "user", "content": user_text})
+
+        result = await agent_graph.ainvoke(
             {"messages": [HumanMessage(content=user_text)]},
             config={"configurable": {"thread_id": CURRENT_CHAR["id"]}}
         )
@@ -605,17 +603,18 @@ async def process_agent_chat(user_text: str) -> str:
         logger.info(f"Agent response: {response_text[:500]}..." if len(response_text) > 500 else f"Agent response: {response_text}")
         if not response_text:
             logger.warning("[AGENT] Empty response after cleaning, returning fallback")
-            return "I couldn't find that information. Could you try rephrasing your question?"
+            response_text = "I couldn't find that information. Could you try rephrasing your question?"
+
+        # Update Legacy History for UI
+        CHAT_HISTORY.append({"role": "assistant", "content": response_text})
+
+        # Async Save
+        await save_memory()
+
         return response_text
     except Exception as e:
         logger.error(f"Agent error: {e}")
         return "I encountered an error processing your request."
-=======
-    # Save History 
-    await save_memory()
-    
-    return response_text
->>>>>>> origin/perf-async-save-memory-13542067766305551337
 
 @app.post("/chat")
 async def chat_endpoint(file: UploadFile = File(...)):
@@ -644,14 +643,24 @@ async def chat_endpoint(file: UploadFile = File(...)):
     if os.path.exists(output_file):
         os.remove(output_file)
         
-    await asyncio.to_thread(subprocess.run, [
+    process = await asyncio.create_subprocess_exec(
         "say",
         "-v", MAC_VOICE,
         "-o", output_file,
         "--data-format=LEF32@22050",
-        final_response
+        final_response,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
-    await proc.wait()
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        logger.error(f"Speech synthesis failed (code {process.returncode}): {stderr.decode()}")
+        return Response(content="Error generating speech", status_code=500)
+
+    if not os.path.exists(output_file):
+         logger.error("Speech synthesis output file missing")
+         return Response(content="Error generating speech", status_code=500)
 
     wav_data = await asyncio.to_thread(read_file_bytes, output_file)
 
