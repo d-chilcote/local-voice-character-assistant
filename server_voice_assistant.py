@@ -316,6 +316,17 @@ async def get_harness():
     """Serves the web-based test harness and handles heartbeats."""
     return Response(content="Voice Assistant Server v2.1", media_type="text/plain")
 
+# --- WEB CHAT HARNESS ---
+from pathlib import Path
+HARNESS_PATH = Path(__file__).parent / "harness.html"
+
+@app.get("/chat")
+async def get_chat_harness():
+    """Serves the web-based chat harness for mobile/desktop browsers."""
+    if not HARNESS_PATH.exists():
+        return Response(content="Chat harness not found", status_code=404)
+    return Response(content=HARNESS_PATH.read_text(), media_type="text/html")
+
 @app.get("/v1")
 @app.head("/v1")
 @app.get("/v1/")
@@ -574,8 +585,11 @@ async def process_agent_chat(user_text: str) -> str:
         # Clean the response
         response_text = clean_response(response_text)
         
-        logger.info(f"Agent response: {response_text[:100]}..." if len(response_text) > 100 else f"Agent response: {response_text}")
-        return response_text if response_text else "I'm not sure how to respond to that."
+        logger.info(f"Agent response: {response_text[:500]}..." if len(response_text) > 500 else f"Agent response: {response_text}")
+        if not response_text:
+            logger.warning("[AGENT] Empty response after cleaning, returning fallback")
+            return "I couldn't find that information. Could you try rephrasing your question?"
+        return response_text
     except Exception as e:
         logger.error(f"Agent error: {e}")
         return "I encountered an error processing your request."

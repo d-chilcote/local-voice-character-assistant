@@ -40,11 +40,25 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
         return None
     
     # First, try to parse Qwen3's <tool_call> JSON format
-    tool_call_match = re.search(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', content, re.DOTALL)
+    tool_call_match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', content, re.DOTALL)
     if tool_call_match:
         try:
             import json
-            tool_data = json.loads(tool_call_match.group(1))
+            json_str = tool_call_match.group(1).strip()
+            # Handle multiple JSON objects by finding first complete one
+            brace_count = 0
+            json_end = 0
+            for i, char in enumerate(json_str):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+            if json_end > 0:
+                json_str = json_str[:json_end]
+            tool_data = json.loads(json_str)
             tool_name = tool_data.get("name") or tool_data.get("function")
             tool_args = tool_data.get("arguments") or tool_data.get("args") or tool_data.get("parameters") or {}
             if tool_name and tool_name in available_tools:
@@ -85,6 +99,11 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
             f"use the {tool_name}",
             f"call {tool_name}",
             f"using {tool_name}",
+            f"i need to search",
+            f"i should search",
+            f"let me search",
+            f"i'll search",
+            f"search for",
         ]
         if any(pattern in content_lower for pattern in use_patterns):
             logger.info(f"[PARSER] Heuristic matched: model wants to use {tool_name}")
@@ -96,10 +115,17 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
                     query = f"current weather in {weather_match.group(1).strip()}"
                     logger.info(f"[PARSER] Extracted query: {query}")
                     return {"name": "google_search", "args": {"query": query}}
-                # Fallback: generic search based on user question
+                # Try to find specific questions in quotes
                 user_q_match = re.search(r'user asks?\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
                 if user_q_match:
                     return {"name": "google_search", "args": {"query": user_q_match.group(1)}}
+                # Try extracting from "about X" or "for X" patterns
+                about_match = re.search(r'(?:about|for)\s+["\']?([^"\'\.]+?)["\']?(?:\.|,|$)', content, re.IGNORECASE)
+                if about_match:
+                    query = about_match.group(1).strip()
+                    if len(query) > 5:  # Avoid tiny matches
+                        logger.info(f"[PARSER] Extracted 'about' query: {query}")
+                        return {"name": "google_search", "args": {"query": query}}
             elif tool_name == "calculator":
                 expr_match = re.search(r'calculate\s+([0-9+\-*/\s().]+)', content, re.IGNORECASE)
                 if expr_match:
@@ -137,7 +163,7 @@ def create_agent_graph(
         
         # Log response details
         logger.info(f"[AGENT] Response type: {type(response).__name__}")
-        content_preview = str(response.content)[:150] if response.content else "(empty)"
+        content_preview = str(response.content)[:500] if response.content else "(empty)"
         logger.info(f"[AGENT] Response content: {content_preview}...")
         
         native_calls = getattr(response, 'tool_calls', []) or []
@@ -156,7 +182,7 @@ def create_agent_graph(
                 if tool_func:
                     try:
                         tool_result = tool_func.invoke(parsed["args"])
-                        logger.info(f"[AGENT] Tool result: {str(tool_result)[:100]}...")
+                        logger.info(f"[AGENT] Tool result: {str(tool_result)[:500]}...")
                         # Create a follow-up message with the result
                         return {
                             "messages": [

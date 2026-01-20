@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Agent Harness | Test Terminal</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         :root {
             --bg: #0f172a;
@@ -138,6 +139,16 @@
             font-size: 0.8rem;
             overflow-x: auto;
         }
+
+        /* Markdown content styling */
+        .assistant p { margin: 0 0 0.5rem 0; }
+        .assistant p:last-child { margin-bottom: 0; }
+        .assistant ul, .assistant ol { margin: 0.5rem 0; padding-left: 1.5rem; }
+        .assistant li { margin: 0.25rem 0; }
+        .assistant code { background: #0f172a; padding: 0.15rem 0.3rem; border-radius: 0.25rem; font-family: 'JetBrains Mono', monospace; font-size: 0.85em; }
+        .assistant pre code { padding: 0; background: transparent; }
+        .assistant strong { color: var(--accent); }
+        .assistant h1, .assistant h2, .assistant h3 { margin: 0.5rem 0; font-size: 1rem; color: var(--accent); }
     </style>
 </head>
 <body>
@@ -166,7 +177,11 @@
         function addMessage(text, role) {
             const div = document.createElement('div');
             div.className = `message ${role}`;
-            div.textContent = text;
+            if (role === 'assistant' && typeof marked !== 'undefined') {
+                div.innerHTML = marked.parse(text);
+            } else {
+                div.textContent = text;
+            }
             chat.appendChild(div);
             chat.scrollTop = chat.scrollHeight;
         }
