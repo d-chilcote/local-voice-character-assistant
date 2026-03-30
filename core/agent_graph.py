@@ -33,13 +33,21 @@ def find_json_block(text: str) -> Optional[str]:
         return None
         
     brace_count = 0
-    for i in range(start, len(text)):
-        if text[i] == '{':
+    next_open = start
+    next_close = text.find('}', start)
+
+    while next_close != -1:
+        # If the next brace is '{' and it appears before the next '}'
+        if next_open != -1 and next_open < next_close:
             brace_count += 1
-        elif text[i] == '}':
+            next_open = text.find('{', next_open + 1)
+        # Otherwise the next brace is '}'
+        else:
             brace_count -= 1
             if brace_count == 0:
-                return text[start:i+1]
+                return text[start:next_close+1]
+            next_close = text.find('}', next_close + 1)
+
     return None
 
 def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optional[Dict[str, Any]]:
