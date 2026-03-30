@@ -16,6 +16,15 @@ from logger_config import get_logger
 
 logger = get_logger(__name__)
 
+# Pre-compiled regex patterns for tool parsing
+QWEN_TOOL_CALL_RE = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL)
+NEMOTRON_FUNC_RE = re.compile(r'<function=(\w+)>(.*?)</function>', re.DOTALL)
+NEMOTRON_PARAM_RE = re.compile(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', re.DOTALL)
+WEATHER_RE = re.compile(r"weather\s+(?:in\s+)?([a-zA-Z\s]+?)(?:\s+today|\"|\'|\.|,|$)", re.IGNORECASE)
+USER_ASK_RE = re.compile(r'user asks?\s*["\']([^"\']+)["\']', re.IGNORECASE)
+ABOUT_RE = re.compile(r'(?:about|for)\s+["\']?([^"\'\.]+?)["\']?(?:\.|,|$)', re.IGNORECASE)
+CALC_RE = re.compile(r'calculate\s+([0-9+\-*/\s().]+)', re.IGNORECASE)
+
 
 class AgentState(TypedDict):
     """Typed state for the LangGraph agent.
@@ -48,7 +57,7 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
         return None
     
     # First, try to parse Qwen3's <tool_call> JSON format
-    tool_call_match = re.search(r'<tool_call>\s*(.*?)\s*</tool_call>', content, re.DOTALL)
+    tool_call_match = QWEN_TOOL_CALL_RE.search(content)
     if tool_call_match:
         try:
             import json
@@ -67,14 +76,14 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
     
     # Second, try Nemotron's <function=X><parameter=Y> XML format
     # Format: <function=google_search>\n<parameter=query>\nvalue\n</parameter>\n</function>
-    func_match = re.search(r'<function=(\w+)>(.*?)</function>', content, re.DOTALL)
+    func_match = NEMOTRON_FUNC_RE.search(content)
     if func_match:
         tool_name = func_match.group(1)
         func_body = func_match.group(2)
         if tool_name in available_tools:
             # Extract parameters
             tool_args = {}
-            param_matches = re.findall(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', func_body, re.DOTALL)
+            param_matches = NEMOTRON_PARAM_RE.findall(func_body)
             for param_name, param_value in param_matches:
                 tool_args[param_name] = param_value.strip()
             logger.info(f"[PARSER] Extracted Nemotron function: {tool_name}({tool_args})")
@@ -122,24 +131,24 @@ def parse_tool_call_from_text(content: str, available_tools: List[str]) -> Optio
             # Extract query context from the user's question
             if tool_name == "google_search":
                 # Try to find weather location or other search context
-                weather_match = re.search(r"weather\s+(?:in\s+)?([a-zA-Z\s]+?)(?:\s+today|\"|\'|\.|,|$)", content, re.IGNORECASE)
+                weather_match = WEATHER_RE.search(content)
                 if weather_match:
                     query = f"current weather in {weather_match.group(1).strip()}"
                     logger.info(f"[PARSER] Extracted query: {query}")
                     return {"name": "google_search", "args": {"query": query}}
                 # Try to find specific questions in quotes
-                user_q_match = re.search(r'user asks?\s*["\']([^"\']+)["\']', content, re.IGNORECASE)
+                user_q_match = USER_ASK_RE.search(content)
                 if user_q_match:
                     return {"name": "google_search", "args": {"query": user_q_match.group(1)}}
                 # Try extracting from "about X" or "for X" patterns
-                about_match = re.search(r'(?:about|for)\s+["\']?([^"\'\.]+?)["\']?(?:\.|,|$)', content, re.IGNORECASE)
+                about_match = ABOUT_RE.search(content)
                 if about_match:
                     query = about_match.group(1).strip()
                     if len(query) > 5:  # Avoid tiny matches
                         logger.info(f"[PARSER] Extracted 'about' query: {query}")
                         return {"name": "google_search", "args": {"query": query}}
             elif tool_name == "calculator":
-                expr_match = re.search(r'calculate\s+([0-9+\-*/\s().]+)', content, re.IGNORECASE)
+                expr_match = CALC_RE.search(content)
                 if expr_match:
                     return {"name": "calculator", "args": {"expression": expr_match.group(1).strip()}}
             break  # Only match one tool
